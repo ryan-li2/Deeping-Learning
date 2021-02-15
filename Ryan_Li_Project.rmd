@@ -1,0 +1,211 @@
+---
+title: "The Mathematical Engineering of Deep Learning"
+author: "Ryan Li"
+date: "15 February 2021"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+header-includes:
+- \usepackage{bm}
+- \usepackage{amsmath}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Reference paper: 
+2014: Conditional Generative Adversarial Nets by Mehdi Mirza and Simon Osindero
+https://arxiv.org/pdf/1411.1784.pdf
+
+Python source code: 
+https://github.com/eriklindernoren/Keras-GAN/blob/master/cgan/cgan.py
+
+```{r}
+library(keras)
+library(listarrays)
+library(progress)
+library(abind)
+k_set_image_data_format('channels_last')
+```
+
+```{r}
+#build the generator network
+generator <- function(latent_size,num_classes=10){
+  model <- keras_model_sequential() %>%
+    layer_dense(256, input_shape = latent_size) %>%
+    layer_activation_leaky_relu(alpha = 0.01) %>%
+    layer_batch_normalization() %>%
+    layer_dense(512, input_shape = latent_size) %>%
+    layer_activation_leaky_relu(alpha = 0.01) %>%
+    layer_batch_normalization() %>%
+    layer_dense(1024, input_shape = latent_size) %>%
+    layer_activation_leaky_relu(alpha = 0.01) %>%
+    layer_batch_normalization() %>%
+    layer_dense(28*28*1, activation = "sigmoid") %>%
+    layer_reshape(c(28,28,1))
+    summary(model)
+    
+    #generator takes z and y as inputs
+    noise <- layer_input(shape = list(latent_size))
+    label <- layer_input(shape = list(1),dtype ='int32')
+    
+    #embedding layer
+  embedding <-  label %>% 
+    layer_embedding(
+      input_dim = num_classes, output_dim = latent_size, 
+      input_length=1
+    )%>%layer_flatten() 
+  
+  #product between z-space and a class conditional embedding
+  joined <- layer_multiply(list(noise, embedding))
+  
+  #generate images
+  fake_image <-  model(joined)
+  
+  keras_model(list(noise, label), fake_image)
+}
+```
+
+
+```{r}
+##build the discriminator network
+discriminator <- function(image_shape,num_classes=10){
+  model <- keras_model_sequential() %>%
+    layer_dense(512, input_shape = 28*28*1) %>%
+    layer_activation_leaky_relu(alpha = 0.01) %>%
+    layer_batch_normalization() %>%
+    layer_dense(512) %>%
+    layer_activation_leaky_relu(alpha = 0.01) %>%
+    layer_batch_normalization() %>%
+    layer_dense(512) %>%
+    layer_activation_leaky_relu(alpha = 0.01) %>%
+    layer_batch_normalization() %>%
+    layer_dense(1, activation = "sigmoid")
+  summary(model)
+  
+  #discriminator takes x and y as inputs
+  image <- layer_input(shape = image_shape) 
+  label <- layer_input(shape = list(1),dtype ='int32')
+  
+  #change 3D of x into a number
+  flat_image <- image %>% layer_flatten()
+  
+  #embedding layer
+  embedding <-  label %>%
+    layer_embedding(
+      input_dim = num_classes, output_dim = 28*28*1, 
+      input_length=1
+    )%>% layer_flatten()
+  
+  #product between image and a class conditional embedding
+  joined <- layer_multiply(list(flat_image, embedding))
+  
+  #predict the valid of the image
+  prediction <- model(joined)
+  
+  keras_model(list(image, label), prediction)
+}
+```
+
+
+
+```{r}
+image_shape <- c(28,28,1)
+# Build and compile the discriminator
+disc <- discriminator(image_shape)
+disc %>% compile(
+  optimizer = optimizer_adam(),
+  loss = list("binary_crossentropy")
+)
+
+# Build the generator
+latent_size <- 100
+gen <- generator(latent_size)
+
+
+noise <- layer_input(shape = list(latent_size))
+label <- layer_input(shape = list(1),dtype ='int32')
+
+#generate fake images
+fake <- gen(list(noise, label))
+
+# Only want to be able to train generation for the combined model
+freeze_weights(disc)
+
+#make a prediction
+results <- disc(c(fake,label))
+
+
+# Trains generator to fool discriminator
+combined <- keras_model(list(noise, label), results)
+combined %>% compile(
+  optimizer = optimizer_sgd(lr=0.01,momentum = 0.5,decay=1.00004),
+  loss = list("binary_crossentropy")
+)
+```
+
+```{r}
+#load the data
+mnist <- dataset_mnist()
+#rescale x from -1 to 1
+X_train <- mnist$train$x/255
+#add a dummy dimension to match with the generated images
+X_train  <- array_reshape(X_train , c(60000, 28, 28,1))
+y_train <- mnist$train$y
+y_train  <- array_reshape(y_train , c(60000,1))
+batch_size <- 100
+valid <- list(rep(1, batch_size))
+fake <- list(rep(0, batch_size))
+iterations <- 5000
+```
+
+```{r}
+start.time <- Sys.time()
+for (iteration in 1:iterations){
+  #random index
+    randomIndex <- sample(1:dim(X_train)[1], size = batch_size)
+    #random images
+    images <- X_train[randomIndex,,,,drop=F]
+    #correspoding labels
+    labels <- y_train[randomIndex,,drop=F]
+    #noise is drawn from uniform distribution
+    noise <- runif(batch_size*latent_size) %>%
+      matrix(nrow = batch_size, ncol = latent_size)
+    #create fake images
+    generated_images <- predict(gen, list(noise, labels))
+    
+    #random labels
+    sampled_labels <- sample(0:9, batch_size, replace = TRUE) %>%
+      matrix(ncol = 1)
+    #caluclate the loss of discriminator
+    disc_loss_real <- train_on_batch(disc,list(images,labels),valid)
+    disc_loss_fake <- train_on_batch(disc,list(generated_images,labels),fake)
+    disc_loss <- disc_loss_real*0.5+disc_loss_fake*0.5
+    
+     #caluclate the loss of geneartor
+    combined_loss <- train_on_batch(
+      combined, list(noise,sampled_labels),
+      valid
+    )
+     if (iteration %% 1000 ==0){
+       cat("Iteration: ", iteration, "\n")
+       cat("Generator loss: ", combined_loss, "\n")
+       cat("Discriminator loss: ", disc_loss, "\n")
+       par(mfrow=c(2,5))
+       for (i in 1:10) { 
+         im <- generated_images[i,,,1]
+         im <- t(apply(im, 2, rev)) 
+         image(im*255,axes = FALSE,col = gray((0:255) / 255), 
+               main=paste(i-1))
+}
+       
+}
+
+}
+end.time <- Sys.time()
+(running.time <- end.time - start.time)
+```
+The loss of generator and discriminator is reasonable which we have compared it with the python source code(in uploaded pdf). However, we still couldn't generate good fake images before the project due day. But we believe the logic of this architecture is correct.
+
+
